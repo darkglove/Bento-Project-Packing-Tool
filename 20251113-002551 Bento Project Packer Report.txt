@@ -1,0 +1,18 @@
+﻿Bento Project Packer Run Report
+Date: 2025-11-13 00:25:51
+Project: E:\Dropbox\Music Production\Bento\Bento Backup 2025.11.01\Projects\GN DO 1\project.xml
+Project Folder: E:\Dropbox\Music Production\Bento\Bento Backup 2025.11.01\Projects\GN DO 1
+Search Roots: E:\Dropbox\Music Production\
+Extensions: .wav, .aif, .aiff, .flac, .mp3, .ogg
+
+Decisions
+---------
+IGNORE-LOCAL | leaf='RC000001.wav' | attr='.\RC000001.wav'
+
+Summary
+-------
+Updated: 0
+Copied: 0
+Missing: 0
+Ambiguous: 0
+Skipped: 2

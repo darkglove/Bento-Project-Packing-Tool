@@ -1,0 +1,6 @@
+# One sample root path per line.
+# Lines starting with # or ; are ignored.
+# Example:
+# D:\Samples
+# E:\Libraries\Audio
+
