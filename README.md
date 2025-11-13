@@ -86,6 +86,11 @@ Parameters:
 - Multiple XML files in folder:
   - Specify the exact XML file instead of the directory.
 
+## TODO
+
+- Group Samples into subfolders as root project folder gets crowded, especially with MultiSample patches
+
+  
 ## License
 
 MIT License © 2025 The Dark Glove - Logical Perspective Ltd
