@@ -1,4 +1,4 @@
-﻿# Bento Project Packer
+﻿# Bento Project Packer - BETA
 
 Bento Project Packer finds all audio files referenced in a Bento `project.xml`, copies them next to the project, and updates the XML to use relative `.\filename` paths. This makes projects easy to share and archive.
 
