@@ -34,6 +34,26 @@ function Get-UniqueFileName {
     }
 }
 
+function Get-SafeFolderName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+    $trimmed = $Name.Trim()
+    if (-not $trimmed) { return '' }
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($ch in $trimmed.ToCharArray()) {
+        if ($invalid -contains $ch) {
+            $null = $builder.Append('_')
+        } else {
+            $null = $builder.Append($ch)
+        }
+    }
+    $candidate = $builder.ToString().Trim()
+    $candidate = $candidate.TrimEnd('.').Trim()
+    if (-not $candidate) { return '' }
+    return $candidate
+}
+
 function Build-NameIndex {
     param(
         [Parameter(Mandatory=$true)][string]$Root,
@@ -205,6 +225,34 @@ function Invoke-BentoProjectPacker {
         return
     }
 
+    $trackInfoMap = @{}
+    $trackNodes = $doc.SelectNodes("//track")
+    $trackOrder = 1
+    foreach ($track in $trackNodes) {
+        $trackParams = $track.SelectSingleNode('./params')
+        $rawName = $null
+        if ($trackParams) {
+            $rawName = $trackParams.GetAttribute('cellname')
+            if (-not $rawName) { $rawName = $trackParams.GetAttribute('name') }
+        }
+        if ([string]::IsNullOrWhiteSpace($rawName)) { $rawName = "Track $trackOrder" }
+        $safeName = Get-SafeFolderName -Name $rawName
+        if (-not $safeName) { $safeName = "Track_$trackOrder" }
+        $folderName = ("{0:D2}-{1}" -f $trackOrder, $safeName)
+        $trackDir = Join-Path $projectDir $folderName
+        $trackId = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($track)
+        $trackInfoMap[$trackId] = [pscustomobject]@{
+            Id = $trackId
+            Name = $rawName
+            FolderName = $folderName
+            Directory = $trackDir
+            Order = $trackOrder
+        }
+        $trackOrder++
+    }
+    $normalizedProjectDir = [System.IO.Path]::GetFullPath($projectDir)
+    if (-not $normalizedProjectDir.EndsWith('\')) { $normalizedProjectDir = $normalizedProjectDir + '\' }
+
     # Determine search strategy
     $esPath = $null
     $es = Get-Command es -ErrorAction SilentlyContinue
@@ -246,14 +294,23 @@ function Invoke-BentoProjectPacker {
         }
     }
 
-    $sourceToDest = @{}   # maps chosen source full path -> final destination file name
+    $sourceToDest = @{}   # maps chosen source full path + track -> final relative destination path
     $stats = [pscustomobject]@{ Updated = 0; Skipped = 0; Missing = 0; Ambiguous = 0; Copied = 0 }
 
     # Track planned destination names to simulate collisions in DryRun and avoid overwrites in Apply
     $plannedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     try {
-        (Get-ChildItem -LiteralPath $projectDir -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) | ForEach-Object { [void]$plannedNames.Add($_) }
+        Get-ChildItem -LiteralPath $projectDir -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $fullPath = [System.IO.Path]::GetFullPath($_.FullName)
+            $relative = $fullPath
+            if ($fullPath.StartsWith($normalizedProjectDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $relative = $fullPath.Substring($normalizedProjectDir.Length)
+            }
+            $relative = $relative.Replace('/', '\')
+            if ($relative) { [void]$plannedNames.Add($relative) }
+        }
     } catch {}
+    $localFilesToDelete = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     # Prepare reporting
     $projectDir  = Split-Path -Path $resolvedXml -Parent
@@ -276,22 +333,40 @@ function Invoke-BentoProjectPacker {
         $normalized = $orig.Trim()
         $normalized = $normalized.Replace('/', '\\')
         $leaf = Split-Path -Path $normalized -Leaf
-
-        # If already .\ reference, ignore this entry (do not search/copy); just normalize the attribute
-        $isAlreadyLocal = $normalized -match '^(?:\.\\|\./)'
-        if ($isAlreadyLocal) {
-            $newRel = ".\$leaf"
-            if ($orig -ne $newRel) { $node.SetAttribute('filename', $newRel); $stats.Updated++ } else { $stats.Skipped++ }
-            if ($Simulate) { Write-Info ("IgnoreLocalRef: attr='{0}'" -f $newRel) }
-            $report.Add(("IGNORE-LOCAL | leaf='{0}' | attr='{1}'" -f $leaf, $newRel)) | Out-Null
-            continue
+        $trackNode = $node.SelectSingleNode('ancestor::track')
+        $trackId = 0
+        $trackInfo = $null
+        if ($trackNode) {
+            $trackId = [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($trackNode)
+            if ($trackInfoMap.ContainsKey($trackId)) { $trackInfo = $trackInfoMap[$trackId] }
         }
 
-        # Prefer candidates using Everything if available; else use indexes
+        $isAlreadyLocal = $normalized -match '^(?:\.\\|\./)'
+        $localRelativePath = $null
+        $localFullPath = $null
+        if ($isAlreadyLocal) {
+            $localRelativePath = $normalized.Substring(2)
+            $localRelativePath = $localRelativePath.TrimStart('\', '/')
+            if (-not $localRelativePath) { $localRelativePath = $leaf }
+            $localFullPath = Join-Path $projectDir $localRelativePath
+            if (-not (Test-Path -LiteralPath $localFullPath -PathType Leaf)) {
+                $msg = "Missing local reference: $localFullPath"
+                Write-Warn $msg
+                if ($Simulate) { Write-Info $msg }
+                $report.Add(("MISSING-LOCAL | attr='{0}' | path='{1}'" -f $orig, $localFullPath)) | Out-Null
+                $localFullPath = $null
+                $localRelativePath = $null
+            }
+        }
+
+        # Prefer candidates using Everything if available; else use indexes (or reuse existing local files)
         $tailDirs = @(Get-TailDirNames -OriginalPath $normalized)
         $candidates = @()
-        if ($esPath) {
-            $candidates = @()
+        $existingRelativeNormalized = $null
+        if ($localFullPath) {
+            $candidates = @($localFullPath)
+            if ($localRelativePath) { $existingRelativeNormalized = $localRelativePath.Replace('/', '\') }
+        } elseif ($esPath) {
             foreach ($root in $SearchRoots) {
                 if (-not (Test-Path -LiteralPath $root)) { continue }
                 $c = Find-CandidatesWithEverything -EsPath $esPath -SearchRoot $root -TailDirNames $tailDirs -LeafFileName $leaf
@@ -353,46 +428,95 @@ function Invoke-BentoProjectPacker {
             $report.Add(("AMBIGUOUS({0}) | leaf='{1}' | chosen='{2}'" -f $candidates.Count, $leaf, $chosen)) | Out-Null
         }
 
-        if ($sourceToDest.ContainsKey($chosen)) {
-            $finalName = $sourceToDest[$chosen]
+        $sourceKey = ("{0}|{1}" -f $trackId, $chosen.ToLowerInvariant())
+        if ($sourceToDest.ContainsKey($sourceKey)) {
+            $finalRelativePath = $sourceToDest[$sourceKey]
         } else {
             $base = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
             $ext  = [System.IO.Path]::GetExtension($leaf)
-            $desiredName = "{0}{1}" -f $base, $ext
-
-            # Resolve collisions using plannedNames and existing files
-            $candidate = $desiredName
-            $n = 1
-            while ($plannedNames.Contains($candidate)) {
-                $candidate = "{0} ({1}){2}" -f $base, $n, $ext
-                $n++
-            }
-            $targetPath = Join-Path $projectDir $candidate
-            while (Test-Path -LiteralPath $targetPath) {
-                $candidate = "{0} ({1}){2}" -f $base, $n, $ext
-                $targetPath = Join-Path $projectDir $candidate
-                $n++
-            }
-            $finalName = $candidate
-            [void]$plannedNames.Add($finalName)
-
-            $destPath = Join-Path $projectDir $finalName
-            if (-not (Test-Path -LiteralPath $destPath)) {
-                if ($Simulate) {
-                    Write-Info ("WhatIf: Copy '{0}' -> '{1}' as '{2}'" -f $chosen, $projectDir, $finalName)
-                } else {
-                    Write-Info ("Copy '{0}' -> '{1}' as '{2}'" -f $chosen, $projectDir, $finalName)
-                    Copy-Item -LiteralPath $chosen -Destination $destPath
-                }
-                $report.Add(("COPY | src='{0}' | dest='{1}'" -f $chosen, $destPath)) | Out-Null
-                $stats.Copied++
+            $candidate = "{0}{1}" -f $base, $ext
+            $targetFolderRelative = $null
+            if ($trackInfo) { $targetFolderRelative = $trackInfo.FolderName }
+            $relativeCandidate = if ($targetFolderRelative) { Join-Path $targetFolderRelative $candidate } else { $candidate }
+            $relativeCandidate = $relativeCandidate.Replace('/', '\')
+            $targetFolderFull = $projectDir
+            if ($trackInfo) { $targetFolderFull = $trackInfo.Directory }
+            $destPath = $null
+            $needsCopy = $true
+            if ($existingRelativeNormalized -and ($existingRelativeNormalized -ieq $relativeCandidate)) {
+                $needsCopy = $false
+                $finalRelativePath = $existingRelativeNormalized
+                $destPath = Join-Path $projectDir $finalRelativePath
             } else {
-                $report.Add(("COPY-SKIP | already exists | dest='{0}'" -f $destPath)) | Out-Null
+                $n = 1
+                while ($plannedNames.Contains($relativeCandidate)) {
+                    $candidate = "{0} ({1}){2}" -f $base, $n, $ext
+                    if ($targetFolderRelative) {
+                        $relativeCandidate = Join-Path $targetFolderRelative $candidate
+                    } else {
+                        $relativeCandidate = $candidate
+                    }
+                    $relativeCandidate = $relativeCandidate.Replace('/', '\')
+                    $n++
+                }
+                $destPath = Join-Path $targetFolderFull $candidate
+                while (Test-Path -LiteralPath $destPath) {
+                    $candidate = "{0} ({1}){2}" -f $base, $n, $ext
+                    if ($targetFolderRelative) {
+                        $relativeCandidate = Join-Path $targetFolderRelative $candidate
+                    } else {
+                        $relativeCandidate = $candidate
+                    }
+                    $relativeCandidate = $relativeCandidate.Replace('/', '\')
+                    $destPath = Join-Path $targetFolderFull $candidate
+                    $n++
+                }
+                $finalRelativePath = $relativeCandidate
             }
-            $sourceToDest[$chosen] = $finalName
+
+            if ($finalRelativePath -and -not $plannedNames.Contains($finalRelativePath)) {
+                [void]$plannedNames.Add($finalRelativePath)
+            }
+
+            if ($needsCopy) {
+                if (-not (Test-Path -LiteralPath $targetFolderFull)) {
+                    if ($Simulate) {
+                        Write-Info ("WhatIf: Create folder '{0}'" -f $targetFolderFull)
+                    } else {
+                        New-Item -ItemType Directory -Path $targetFolderFull -Force | Out-Null
+                    }
+                }
+
+                if (-not (Test-Path -LiteralPath $destPath)) {
+                    $leafName = Split-Path -Path $finalRelativePath -Leaf
+                    if ($Simulate) {
+                        Write-Info ("WhatIf: Copy '{0}' -> '{1}' as '{2}'" -f $chosen, $targetFolderFull, $leafName)
+                    } else {
+                        Write-Info ("Copy '{0}' -> '{1}' as '{2}'" -f $chosen, $targetFolderFull, $leafName)
+                        Copy-Item -LiteralPath $chosen -Destination $destPath
+                    }
+                    $report.Add(("COPY | src='{0}' | dest='{1}'" -f $chosen, $destPath)) | Out-Null
+                    $stats.Copied++
+                } else {
+                    $report.Add(("COPY-SKIP | already exists | dest='{0}'" -f $destPath)) | Out-Null
+                }
+
+                if ($localFullPath -and $existingRelativeNormalized -and ($finalRelativePath -ne $existingRelativeNormalized)) {
+                    $added = $localFilesToDelete.Add($localFullPath)
+                    if ($added) {
+                        if ($Simulate) {
+                            Write-Info ("WhatIf: Would delete old local '{0}' after packaging" -f $localFullPath)
+                        }
+                        $report.Add(("REPACK-LOCAL | from='{0}' | to='{1}'" -f $localFullPath, $destPath)) | Out-Null
+                    }
+                }
+            } else {
+                $report.Add(("REUSE | dest='{0}'" -f (Join-Path $projectDir $finalRelativePath))) | Out-Null
+            }
+            $sourceToDest[$sourceKey] = $finalRelativePath
         }
 
-        $newValue = ".\$finalName"
+        $newValue = ".\" + ($finalRelativePath -replace '/', '\')
         if ($orig -ne $newValue) {
             $node.SetAttribute('filename', $newValue)
             $stats.Updated++
@@ -402,6 +526,25 @@ function Invoke-BentoProjectPacker {
             $stats.Skipped++
             if ($Simulate) { Write-Info ("Attr already correct: '{0}'" -f $newValue) }
             $report.Add(("SETATTR-SKIP | already .\\ | filename='{0}'" -f $newValue)) | Out-Null
+        }
+    }
+
+    if ($localFilesToDelete.Count -gt 0) {
+        foreach ($oldPath in $localFilesToDelete) {
+            if ($Simulate) {
+                Write-Info ("WhatIf: Would delete '{0}' after repack" -f $oldPath)
+                $report.Add(("DELETE-LOCAL-WHATIF | path='{0}'" -f $oldPath)) | Out-Null
+            } else {
+                try {
+                    if (Test-Path -LiteralPath $oldPath) {
+                        Remove-Item -LiteralPath $oldPath -Force
+                        $report.Add(("DELETE-LOCAL | path='{0}'" -f $oldPath)) | Out-Null
+                    }
+                } catch {
+                    $report.Add(("DELETE-LOCAL-FAIL | path='{0}' | err='{1}'" -f $oldPath, $_)) | Out-Null
+                    Write-Warn ("Failed to delete '{0}': {1}" -f $oldPath, $_)
+                }
+            }
         }
     }
 
